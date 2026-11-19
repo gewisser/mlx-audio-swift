@@ -7,12 +7,73 @@
 //  Ported from mlx-audio Python: voxcpm2/voxcpm2.py
 //
 
+import Accelerate
 import Foundation
 import HuggingFace
 @preconcurrency import MLX
 import MLXNN
 @preconcurrency import MLXAudioCore
 import Tokenizers
+
+// MARK: - Reference resampling
+
+/// The resampler the Python port encodes references with (`mlx_audio.resample.resample_audio_array`):
+/// scipy `resample_poly` with resampy's `kaiser_best` FIR - `firwin(2 * 64 * max_rate + 1,
+/// 0.9475937167399596 / max_rate, window=("kaiser", 14.769656459379492))`, `padtype="edge"`,
+/// computed in float64. Only the integer decimation case (up = 1) is ported.
+public enum KaiserBestResampler {
+    static let numZeros = 64
+    static let rolloff = 0.9475937167399596
+    static let beta = 14.769656459379492
+
+    /// nil when `from / to` is not an integer.
+    public static func decimate(_ x: [Float], from: Int, to: Int) -> [Float]? {
+        guard from > to, from % to == 0, !x.isEmpty else { return nil }
+        let down = from / to
+        let h = firwin(numTaps: 2 * numZeros * down + 1, cutoff: rolloff / Double(down))
+        let halfLength = (h.count - 1) / 2
+        let outCount = (x.count + down - 1) / down
+
+        // y[n] = sum_j h[j] * x[down*n + halfLength - j], x extended by its edge values
+        // (scipy upfirdn, mode "edge"). vDSP_desampD computes C[n] = sum_p A[down*n + p] * F[p],
+        // so A is x shifted by halfLength and F is h reversed.
+        let padded = (0 ..< (down * (outCount - 1) + h.count)).map { i -> Double in
+            Double(x[min(max(i - halfLength, 0), x.count - 1)])
+        }
+        let reversed = Array(h.reversed())
+        var y = [Double](repeating: 0, count: outCount)
+        vDSP_desampD(padded, vDSP_Stride(down), reversed, &y, vDSP_Length(outCount), vDSP_Length(h.count))
+        return y.map { Float($0) }
+    }
+
+    /// scipy.signal.firwin, low-pass, Kaiser window, scaled to unit gain at DC.
+    static func firwin(numTaps: Int, cutoff: Double) -> [Double] {
+        let alpha = Double(numTaps - 1) / 2
+        let i0Beta = besselI0(beta)
+        var h = (0 ..< numTaps).map { n -> Double in
+            let m = Double(n) - alpha
+            let x = cutoff * m
+            let sinc = x == 0 ? 1 : Foundation.sin(Double.pi * x) / (Double.pi * x)
+            let r = Double(n) / alpha - 1
+            return cutoff * sinc * besselI0(beta * (1 - r * r).squareRoot()) / i0Beta
+        }
+        let sum = h.reduce(0, +)
+        for n in h.indices { h[n] /= sum }
+        return h
+    }
+
+    static func besselI0(_ x: Double) -> Double {
+        var sum = 1.0
+        var term = 1.0
+        let q = x * x / 4
+        for k in 1 ..< 500 {
+            term *= q / Double(k * k)
+            sum += term
+            if term < sum * 1e-17 { break }
+        }
+        return sum
+    }
+}
 
 // MARK: - Scalar Quantization
 
@@ -165,7 +226,11 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
     // MARK: - Audio Encoding
 
-    func encodeWav(_ audio: MLXArray) throws -> MLXArray {
+    /// Which side `encodeWav` pads to patch alignment: the reference on the right, the Hi-Fi
+    /// prompt on the left, as Python's `_encode_wav(padding_mode:)`.
+    public enum Padding: Sendable { case right, left }
+
+    public func encodeWav(_ audio: MLXArray, padding: Padding = .right) throws -> MLXArray {
         var inp = audio
 
         // Resample from output rate (48kHz) to encoder rate (16kHz) if needed
@@ -174,7 +239,10 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         if outRate != encRate {
             let flat = inp.ndim == 1 ? inp : inp.flattened()
             let samples = flat.asArray(Float.self)
-            let resampled = try resampleAudio(samples, from: outRate, to: encRate)
+            // Python's resampler where the ratio is an integer decimation (48 -> 16 kHz): with
+            // AVAudioConverter's defaults the reference latents differed from Python's by 13 %.
+            let resampled = try KaiserBestResampler.decimate(samples, from: outRate, to: encRate)
+                ?? resampleAudio(samples, from: outRate, to: encRate)
             inp = MLXArray(resampled)
         }
 
@@ -190,7 +258,8 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         let remainder = length % patchLen
         if remainder != 0 {
             let padSize = patchLen - remainder
-            inp = MLX.padded(inp, widths: [IntOrPair((0, 0)), IntOrPair((0, 0)), IntOrPair((0, padSize))])
+            let side = padding == .left ? IntOrPair((padSize, 0)) : IntOrPair((0, padSize))
+            inp = MLX.padded(inp, widths: [IntOrPair((0, 0)), IntOrPair((0, 0)), side])
         }
 
         // VAE encode: input is (B, 1, T) in channel-first
@@ -236,7 +305,7 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
     // MARK: - Tokenization
 
-    func tokenize(_ text: String) throws -> [Int] {
+    public func tokenize(_ text: String) throws -> [Int] {
         guard let tokenizer else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
         }
@@ -270,61 +339,68 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
 
     // MARK: - Generation
 
-    public func generate(
+    /// Every mode of the Python port's `generate` (mlx_audio 0.6.6, `voxcpm2.py`), with cfg and
+    /// diffusion steps given per call rather than read from the config:
+    /// - `refAudio` + `promptAudio` + `promptText`: Hi-Fi («ultimate cloning», Python mode 4)
+    /// - `refAudio`: reference cloning (mode 3)
+    /// - `promptAudio` + `promptText`: continuation (mode 2)
+    /// - none: zero-shot (mode 1)
+    /// Audio is mono at `sampleRate` (48 kHz). There is no instruction parameter: OpenBMB disables
+    /// it in ultimate cloning, and the mlx port, which prepends `(instruct)` to the text, gets it
+    /// read aloud.
+    public func generateAudio(
         text: String,
-        voice: String?,
-        refAudio: MaterializedArray?,
-        refText: String?,
-        language: String?,
-        generationParameters: GenerateParameters
-    ) async throws -> MaterializedArray {
-        let maxTokens = generationParameters.maxTokens ?? config.maxLength
-        let minTokens = 2
-        let inferenceTimesteps = config.inferenceTimesteps
-        let cfgValue = config.cfgScale
-
+        refAudio: MLXArray? = nil,
+        promptAudio: MLXArray? = nil,
+        promptText: String? = nil,
+        cfgValue: Float,
+        inferenceTimesteps: Int,
+        maxTokens: Int = 2000,
+        minTokens: Int = 2,
+        streamingPrefixLen: Int = 4
+    ) throws -> MLXArray {
         let scaleEmb = Float(config.lmConfig.useMup ? config.lmConfig.scaleEmb : 1)
         let latentDim = audioVAE.latentDim
 
-        // Tokenize text
-        let textIds = try tokenize(text)
+        // The prompt's transcript goes in front of the text, its audio after it (Python modes 2, 4).
+        var prompt: (audio: MLXArray, text: String)?
+        if let promptAudio, let promptText { prompt = (promptAudio, promptText) }
 
-        // Determine mode: reference cloning vs zero-shot
-        let textToken: MLXArray
-        let audioFeat: MLXArray
-        let textMask: MLXArray
-        let audioMask: MLXArray
+        let textIds = try tokenize((prompt?.text ?? "") + text)
+        let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
+        let textLength = tokenArray.dim(0)
+
+        var tokens: [MLXArray] = []
+        var feats: [MLXArray] = []
+        var tMasks: [MLXArray] = []
+        var aMasks: [MLXArray] = []
 
         if let refAudio {
-            // Reference cloning mode
-            let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
-            let textLength = tokenArray.dim(0)
-
-            let refFeat = try encodeWav(refAudio)
-            let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(refFeat)
-
-            let textPadFeat = MLXArray.zeros([textLength, patchSize, latentDim])
-
-            textToken = MLX.concatenated([refTokens, tokenArray])
-            audioFeat = MLX.concatenated([refFeats, textPadFeat], axis: 0)
-            textMask = MLX.concatenated([
-                refTMask,
-                MLXArray.ones([textLength]),
-            ])
-            audioMask = MLX.concatenated([
-                refAMask,
-                MLXArray.zeros([textLength]),
-            ])
-        } else {
-            // Zero-shot mode
-            let tokenArray = MLXArray((textIds + [Int(audioStartToken)]).map { Int32($0) })
-            let textLength = tokenArray.dim(0)
-
-            textToken = tokenArray
-            audioFeat = MLXArray.zeros([textLength, patchSize, latentDim])
-            textMask = MLXArray.ones([textLength])
-            audioMask = MLXArray.zeros([textLength])
+            let (refTokens, refFeats, refTMask, refAMask) = makeRefPrefix(try encodeWav(refAudio, padding: .right))
+            tokens.append(refTokens)
+            feats.append(refFeats)
+            tMasks.append(refTMask)
+            aMasks.append(refAMask)
         }
+
+        tokens.append(tokenArray)
+        feats.append(MLXArray.zeros([textLength, patchSize, latentDim]))
+        tMasks.append(MLXArray.ones([textLength]))
+        aMasks.append(MLXArray.zeros([textLength]))
+
+        if let prompt {
+            let promptFeat = try encodeWav(prompt.audio, padding: .left)
+            let promptLength = promptFeat.dim(0)
+            tokens.append(MLXArray.zeros([promptLength]).asType(.int32))
+            feats.append(promptFeat)
+            tMasks.append(MLXArray.zeros([promptLength]))
+            aMasks.append(MLXArray.ones([promptLength]))
+        }
+
+        let textToken = MLX.concatenated(tokens)
+        let audioFeat = MLX.concatenated(feats, axis: 0)
+        let textMask = MLX.concatenated(tMasks)
+        let audioMask = MLX.concatenated(aMasks)
 
         // Add batch dimension
         let bTextToken = textToken.expandedDimensions(axis: 0)
@@ -365,7 +441,19 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         var residualHidden = residualOutputs[0..., -1, 0...]
 
         var predFeatSeq: [MLXArray] = []
-        predFeatSeq.reserveCapacity(maxTokens)
+        predFeatSeq.reserveCapacity(maxTokens + streamingPrefixLen)
+
+        // Continuation (the sequence ends in audio): seed the decoded sequence with the last
+        // patches of the prompt, and trim their audio off after decoding - Python's
+        // `has_continuation` branch.
+        let audioIndices = audioMask.asArray(Float.self).enumerated().filter { $0.element > 0 }.map(\.offset)
+        let hasContinuation = audioMask[-1].item(Float.self) == 1
+        if hasContinuation {
+            let contextLength = min(streamingPrefixLen - 1, audioIndices.count)
+            for index in audioIndices.suffix(contextLength) {
+                predFeatSeq.append(bAudioFeat[0..., index, 0..., 0...][0..., .newAxis, 0..., 0...])
+            }
+        }
 
         // Generation loop
         for i in 0 ..< maxTokens {
@@ -428,9 +516,35 @@ public final class VoxCPM2Model: Module, SpeechGenerationModel, @unchecked Senda
         let B = allFeats.dim(0)
         let allFeatsFlat = allFeats.reshaped(B, -1, featDim) // (B, Total*P, D)
 
-        let audio = audioVAE.decode(allFeatsFlat).flattened()
+        var audio = audioVAE.decode(allFeatsFlat).flattened()
+
+        // Trim the continuation prefix
+        if hasContinuation {
+            let trimSamples = patchSize * audioVAE.decodeChunkSize * (streamingPrefixLen - 1)
+            if trimSamples < audio.dim(0) {
+                audio = audio[trimSamples...]
+            }
+        }
         eval(audio)
-        return (audio).materialized()
+        return audio
+    }
+
+    public func generate(
+        text: String,
+        voice: String?,
+        refAudio: MaterializedArray?,
+        refText: String?,
+        language: String?,
+        generationParameters: GenerateParameters
+    ) async throws -> MaterializedArray {
+        let audio = try generateAudio(
+            text: text,
+            refAudio: refAudio,
+            cfgValue: config.cfgScale,
+            inferenceTimesteps: config.inferenceTimesteps,
+            maxTokens: generationParameters.maxTokens ?? config.maxLength
+        )
+        return audio.materialized()
     }
 
     public func generateStream(
